@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "ds-context": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "REPLACE_WITH_ABSOLUTE_PATH_TO_REPO",
+        "run",
+        "python",
+        "-m",
+        "ds_context_mcp.server"
+      ]
+    }
+  }
+}
