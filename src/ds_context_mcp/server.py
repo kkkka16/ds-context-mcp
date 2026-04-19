@@ -8,13 +8,10 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+from ds_context_mcp.tools.datasets import register_dataset_tools
+
 mcp: FastMCP = FastMCP("ds-context-mcp")
-
-
-# ツールは後続のフェーズで tools/ 配下から import して登録する
-# 例:
-# from ds_context_mcp.tools.datasets import register_dataset_tools
-# register_dataset_tools(mcp)
+register_dataset_tools(mcp)
 
 
 def main() -> None:
