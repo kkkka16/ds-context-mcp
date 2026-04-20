@@ -20,6 +20,10 @@ _MAX_SAMPLE_SIZE: int = 20
 _SAMPLE_VALUE_MAX_UNIQUE: int = 10
 _SAMPLE_VALUE_RETURN_COUNT: int = 5
 _SAMPLE_VALUE_MAX_LEN: int = 100
+_SAMPLE_ROWS_MAX_N: int = 100
+_SAMPLE_ROWS_VALID_MODES: frozenset[str] = frozenset({"head", "tail", "random"})
+_COLUMN_PROFILE_MAX_TOP_K: int = 50
+_TOP_VALUE_MAX_LEN: int = 100
 
 _EXCLUDED_DIR_NAMES: frozenset[str] = frozenset(
     {
@@ -471,6 +475,410 @@ def describe_dataset(
     )
 
 
+class SampleRowsResult(BaseModel):
+    """Result of a sample_rows call.
+
+    Attributes:
+        path: Absolute resolved path of the file.
+        format: ``"csv"`` / ``"parquet"`` / ``"feather"`` (empty on error).
+        total_rows: Total number of rows in the file.
+        returned_rows: Number of rows actually returned.
+        mode: Sampling mode used (``"head"`` / ``"tail"`` / ``"random"``).
+        columns: Column names in declaration order.
+        rows: Sampled rows as JSON-friendly dicts. ``NaN`` becomes ``None``,
+            datetime becomes ISO8601, bytes becomes ``str``.
+        error: Fatal error message; set only on failure.
+    """
+
+    path: str
+    format: str
+    total_rows: int
+    returned_rows: int
+    mode: str
+    columns: list[str]
+    rows: list[dict[str, object]]
+    error: str | None = None
+
+
+class TopValue(BaseModel):
+    """A single (value, count, frequency) triple in a column's frequency table.
+
+    Attributes:
+        value: Stringified value, truncated to 100 chars (with ``"..."``).
+        count: Number of occurrences (non-NaN).
+        frequency: ``count / total_count``, in ``[0.0, 1.0]``.
+    """
+
+    value: str
+    count: int
+    frequency: float
+
+
+class NumericStats(BaseModel):
+    """Numeric summary statistics for a single column.
+
+    Attributes:
+        min: Minimum value.
+        max: Maximum value.
+        mean: Arithmetic mean.
+        median: Median (50th percentile).
+        std: Sample standard deviation (``ddof=1``).
+        q25: 25th percentile.
+        q75: 75th percentile.
+        outlier_count: Number of values outside ``[Q1 - 1.5*IQR, Q3 + 1.5*IQR]``.
+        has_negative: ``True`` if any value is negative.
+        has_zero: ``True`` if any value equals zero.
+    """
+
+    min: float
+    max: float
+    mean: float
+    median: float
+    std: float
+    q25: float
+    q75: float
+    outlier_count: int
+    has_negative: bool
+    has_zero: bool
+
+
+class StringStats(BaseModel):
+    """String length statistics for a single column.
+
+    Attributes:
+        min_length: Minimum string length among non-NaN values.
+        max_length: Maximum string length among non-NaN values.
+        mean_length: Mean string length among non-NaN values.
+        empty_count: Number of empty-string occurrences.
+    """
+
+    min_length: int
+    max_length: int
+    mean_length: float
+    empty_count: int
+
+
+class ColumnProfileResult(BaseModel):
+    """Result of a column_profile call.
+
+    Attributes:
+        path: Absolute resolved path of the file.
+        column: Target column name.
+        dtype: pandas dtype string.
+        total_count: Number of non-NaN cells.
+        missing_count: Number of NaN cells.
+        missing_rate: Ratio of missing cells, in ``[0.0, 1.0]``.
+        unique_count: Number of unique non-NaN values.
+        cardinality_ratio: ``unique_count / total_count``; 1.0 means all unique.
+        top_values: Frequency table sorted by descending count.
+        numeric_stats: Set only for numeric columns.
+        string_stats: Set only for string/object/category columns.
+        error: Fatal error message; set only on failure.
+    """
+
+    path: str
+    column: str
+    dtype: str
+    total_count: int
+    missing_count: int
+    missing_rate: float
+    unique_count: int
+    cardinality_ratio: float
+    top_values: list[TopValue]
+    numeric_stats: NumericStats | None = None
+    string_stats: StringStats | None = None
+    error: str | None = None
+
+
+def _sample_rows_error(path: str, mode: str, message: str) -> SampleRowsResult:
+    """Return a failure ``SampleRowsResult`` with zeroed metrics."""
+    return SampleRowsResult(
+        path=path,
+        format="",
+        total_rows=0,
+        returned_rows=0,
+        mode=mode,
+        columns=[],
+        rows=[],
+        error=message,
+    )
+
+
+def _column_profile_error(path: str, column: str, message: str) -> ColumnProfileResult:
+    """Return a failure ``ColumnProfileResult`` with zeroed metrics."""
+    return ColumnProfileResult(
+        path=path,
+        column=column,
+        dtype="",
+        total_count=0,
+        missing_count=0,
+        missing_rate=0.0,
+        unique_count=0,
+        cardinality_ratio=0.0,
+        top_values=[],
+        numeric_stats=None,
+        string_stats=None,
+        error=message,
+    )
+
+
+def _validate_data_file(path_str: str) -> tuple[Path, str] | str:
+    """Resolve and validate a data file path.
+
+    Returns:
+        A ``(resolved_path, ext)`` tuple on success, or an error message string.
+    """
+    resolved = Path(path_str).resolve()
+    if not resolved.exists():
+        return f"File does not exist: {resolved}"
+    if resolved.is_dir():
+        return f"Path is a directory, not a file: {resolved}"
+    if not resolved.is_file():
+        return f"Path is not a regular file: {resolved}"
+    ext = resolved.suffix.lower()
+    if ext not in _DESCRIBE_SUPPORTED_EXTENSIONS:
+        return f"Unsupported extension: {ext} (supported: .csv, .parquet, .feather)"
+    return resolved, ext
+
+
+def _df_to_rows(df: pd.DataFrame) -> list[dict[str, object]]:
+    """Convert a DataFrame to JSON-friendly row dicts."""
+    rows: list[dict[str, object]] = []
+    for record in df.to_dict(orient="records"):
+        rows.append({str(k): _convert_cell(v) for k, v in record.items()})
+    return rows
+
+
+def sample_rows(
+    file_path: str,
+    n: int = 10,
+    mode: str = "head",
+    seed: int | None = None,
+) -> SampleRowsResult:
+    """Return sample rows from a dataset file.
+
+    Reads a CSV / Parquet / Feather file and returns up to ``n`` rows according
+    to ``mode``. Useful for inspecting actual data values once the schema is
+    known via :func:`describe_dataset`.
+
+    Args:
+        file_path: Path to the data file. Relative paths are resolved.
+        n: Number of rows to return. Clipped to ``[0, 100]``.
+        mode: ``"head"`` (default), ``"tail"``, or ``"random"``.
+        seed: Random seed used only when ``mode="random"``.
+
+    Returns:
+        A :class:`SampleRowsResult`. Fatal issues are reported via the
+        ``error`` field instead of raising.
+    """
+    resolved_path = Path(file_path).resolve()
+    path_str = str(resolved_path)
+
+    validated = _validate_data_file(file_path)
+    if isinstance(validated, str):
+        return _sample_rows_error(path_str, mode, validated)
+    resolved, ext = validated
+    path_str = str(resolved)
+
+    if mode not in _SAMPLE_ROWS_VALID_MODES:
+        valid = ", ".join(sorted(_SAMPLE_ROWS_VALID_MODES))
+        return _sample_rows_error(path_str, mode, f"Invalid mode: {mode!r} (valid: {valid})")
+
+    try:
+        stat = resolved.stat()
+    except OSError as exc:
+        return _sample_rows_error(path_str, mode, f"Failed to stat file: {exc}")
+    if int(stat.st_size) > _MAX_FILE_SIZE_BYTES:
+        return _sample_rows_error(path_str, mode, "ファイルサイズが大きすぎます (最大500MB)")
+
+    try:
+        df = _read_dataframe(resolved, ext)
+    except Exception as exc:
+        return _sample_rows_error(path_str, mode, f"Failed to read file: {exc}")
+
+    total_rows = int(df.shape[0])
+    clipped_n = max(0, min(n, _SAMPLE_ROWS_MAX_N))
+
+    if mode == "head":
+        sampled = df.head(clipped_n)
+    elif mode == "tail":
+        sampled = df.tail(clipped_n)
+    else:
+        take = min(clipped_n, total_rows)
+        sampled = df.sample(n=take, random_state=seed) if take > 0 else df.head(0)
+
+    rows = _df_to_rows(sampled)
+
+    return SampleRowsResult(
+        path=path_str,
+        format=ext.lstrip("."),
+        total_rows=total_rows,
+        returned_rows=len(rows),
+        mode=mode,
+        columns=[str(c) for c in df.columns],
+        rows=rows,
+        error=None,
+    )
+
+
+def _truncate_top_value(text: str) -> str:
+    """Truncate a top-value string to ``_TOP_VALUE_MAX_LEN`` chars."""
+    if len(text) > _TOP_VALUE_MAX_LEN:
+        return text[:_TOP_VALUE_MAX_LEN] + "..."
+    return text
+
+
+def _build_top_values(series: pd.Series, top_k: int, total_count: int) -> list[TopValue]:
+    """Build a frequency table of the top ``top_k`` non-NaN values."""
+    if total_count == 0:
+        return []
+    counts = series.dropna().value_counts().head(top_k)
+    result: list[TopValue] = []
+    for raw_value, raw_count in counts.items():
+        count_int = int(raw_count)
+        result.append(
+            TopValue(
+                value=_truncate_top_value(str(raw_value)),
+                count=count_int,
+                frequency=count_int / total_count,
+            )
+        )
+    return result
+
+
+def _build_numeric_stats(series: pd.Series) -> NumericStats | None:
+    """Compute :class:`NumericStats` for a numeric series, or ``None`` if empty."""
+    non_null = series.dropna()
+    if non_null.empty:
+        return None
+    q1 = float(non_null.quantile(0.25))
+    q3 = float(non_null.quantile(0.75))
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    outlier_count = int(((non_null < lower) | (non_null > upper)).sum())
+    std_value = non_null.std(ddof=1)
+    std_float = 0.0 if pd.isna(std_value) else float(std_value)
+    return NumericStats(
+        min=float(non_null.min()),
+        max=float(non_null.max()),
+        mean=float(non_null.mean()),
+        median=float(non_null.median()),
+        std=std_float,
+        q25=q1,
+        q75=q3,
+        outlier_count=outlier_count,
+        has_negative=bool((non_null < 0).any()),
+        has_zero=bool((non_null == 0).any()),
+    )
+
+
+def _build_string_stats(series: pd.Series) -> StringStats | None:
+    """Compute :class:`StringStats` for a string-like series, or ``None`` if empty."""
+    non_null = series.dropna()
+    if non_null.empty:
+        return None
+    lengths = non_null.astype(str).str.len()
+    empty_count = int((non_null.astype(str) == "").sum())
+    return StringStats(
+        min_length=int(lengths.min()),
+        max_length=int(lengths.max()),
+        mean_length=float(lengths.mean()),
+        empty_count=empty_count,
+    )
+
+
+def column_profile(
+    file_path: str,
+    column: str,
+    top_k: int = 10,
+) -> ColumnProfileResult:
+    """Profile a single column in depth.
+
+    Returns missing rate, cardinality, top values, and dtype-specific stats
+    (numeric or string). Designed to be called after :func:`describe_dataset`
+    when one column needs deeper inspection.
+
+    Args:
+        file_path: Path to the data file. Relative paths are resolved.
+        column: Name of the column to profile.
+        top_k: Maximum number of frequency entries to return. Clipped to
+            ``[0, 50]``.
+
+    Returns:
+        A :class:`ColumnProfileResult`. Missing column / file errors are
+        reported via the ``error`` field instead of raising.
+    """
+    resolved_path = Path(file_path).resolve()
+    path_str = str(resolved_path)
+
+    validated = _validate_data_file(file_path)
+    if isinstance(validated, str):
+        return _column_profile_error(path_str, column, validated)
+    resolved, ext = validated
+    path_str = str(resolved)
+
+    try:
+        stat = resolved.stat()
+    except OSError as exc:
+        return _column_profile_error(path_str, column, f"Failed to stat file: {exc}")
+    if int(stat.st_size) > _MAX_FILE_SIZE_BYTES:
+        return _column_profile_error(path_str, column, "ファイルサイズが大きすぎます (最大500MB)")
+
+    try:
+        df = _read_dataframe(resolved, ext)
+    except Exception as exc:
+        return _column_profile_error(path_str, column, f"Failed to read file: {exc}")
+
+    if column not in df.columns:
+        available = [str(c) for c in df.columns]
+        return _column_profile_error(
+            path_str,
+            column,
+            f"Column {column!r} not found. Available: {available}",
+        )
+
+    series = df[column]
+    total = len(series)
+    missing_count = int(series.isna().sum())
+    total_count = total - missing_count
+    missing_rate = (missing_count / total) if total > 0 else 0.0
+    unique_count = int(series.dropna().nunique())
+    cardinality_ratio = (unique_count / total_count) if total_count > 0 else 0.0
+
+    clipped_top_k = max(0, min(top_k, _COLUMN_PROFILE_MAX_TOP_K))
+    top_values = _build_top_values(series, clipped_top_k, total_count)
+
+    numeric_stats: NumericStats | None = None
+    string_stats: StringStats | None = None
+    is_numeric = pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
+    is_string_like = (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+        or isinstance(series.dtype, pd.CategoricalDtype)
+    )
+    if total_count > 0:
+        if is_numeric:
+            numeric_stats = _build_numeric_stats(series)
+        elif is_string_like:
+            string_stats = _build_string_stats(series)
+
+    return ColumnProfileResult(
+        path=path_str,
+        column=column,
+        dtype=str(series.dtype),
+        total_count=total_count,
+        missing_count=missing_count,
+        missing_rate=missing_rate,
+        unique_count=unique_count,
+        cardinality_ratio=cardinality_ratio,
+        top_values=top_values,
+        numeric_stats=numeric_stats,
+        string_stats=string_stats,
+        error=None,
+    )
+
+
 def register_dataset_tools(mcp: FastMCP) -> None:
     """Register dataset-related tools to the MCP server.
 
@@ -506,3 +914,36 @@ def register_dataset_tools(mcp: FastMCP) -> None:
         Supports CSV, Parquet, and Feather formats.
         """
         return describe_dataset(file_path, include_sample, sample_size)
+
+    @mcp.tool()
+    def sample_rows_tool(
+        file_path: str,
+        n: int = 10,
+        mode: str = "head",
+        seed: int | None = None,
+    ) -> SampleRowsResult:
+        """Return sample rows from a dataset file (head/tail/random).
+
+        Use this tool to inspect actual data values when you need to see what's
+        in the rows, not just the schema. Prefer describe_dataset first for
+        schema, then sample_rows for concrete values.
+
+        Supports CSV, Parquet, and Feather formats.
+        """
+        return sample_rows(file_path, n, mode, seed)
+
+    @mcp.tool()
+    def column_profile_tool(
+        file_path: str,
+        column: str,
+        top_k: int = 10,
+    ) -> ColumnProfileResult:
+        """Profile a single column in depth: stats, top values, outliers.
+
+        Use this tool AFTER describe_dataset when you need detailed analysis of
+        one specific column (distribution, outliers, cardinality, frequency of
+        values). Essential before writing visualization or encoding code.
+
+        Supports CSV, Parquet, and Feather formats.
+        """
+        return column_profile(file_path, column, top_k)
